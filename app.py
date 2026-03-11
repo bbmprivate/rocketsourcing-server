@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 RocketSourcing 인증 서버
-- Flask + SQLite
+- Flask + Supabase (supabase-py)
 - 관리자가 ID 배포 방식 (회원가입 없음)
 - MAC 주소 기반 PC 사용 대수 제한
-- Render.com / Railway 무료 배포 가능
+- Render.com 무료 배포
 """
 
 from flask import Flask, request, jsonify
-import sqlite3
+from supabase import create_client, Client
 import hashlib
 import os
 import datetime
@@ -17,51 +17,17 @@ from functools import wraps
 app = Flask(__name__)
 
 # ===================== 환경 설정 =====================
-DB_PATH = os.environ.get("DB_PATH", "users.db")
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "rocketsourcing_admin_2024")  # 배포 시 반드시 변경
+SUPABASE_URL     = os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+ADMIN_KEY        = os.environ.get("ADMIN_KEY", "rocketsourcing_admin_2024")
 
-# ===================== DB 초기화 =====================
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    conn = get_db()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            username        TEXT UNIQUE NOT NULL,
-            password_hash   TEXT NOT NULL,
-            name            TEXT DEFAULT '',
-            expiry_date     TEXT NOT NULL,
-            mac_limit       INTEGER DEFAULT 1,
-            is_active       INTEGER DEFAULT 1,
-            memo            TEXT DEFAULT '',
-            created_at      TEXT DEFAULT (datetime('now', 'localtime'))
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS user_macs (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id         INTEGER NOT NULL,
-            mac_address     TEXT NOT NULL,
-            registered_at   TEXT DEFAULT (datetime('now', 'localtime')),
-            last_seen       TEXT DEFAULT (datetime('now', 'localtime')),
-            FOREIGN KEY (user_id) REFERENCES users(id),
-            UNIQUE(user_id, mac_address)
-        )
-    """)
-    conn.commit()
-    conn.close()
-    print("[DB] 초기화 완료")
+db: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 # ===================== 유틸 =====================
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 def require_admin(f):
-    """관리자 키 검증 데코레이터"""
     @wraps(f)
     def decorated(*args, **kwargs):
         key = request.headers.get("X-Admin-Key", "")
@@ -74,8 +40,7 @@ def require_admin(f):
 
 @app.route("/api/login", methods=["POST"])
 def login():
-    """로그인 + MAC 주소 체크"""
-    data = request.get_json(silent=True) or {}
+    data        = request.get_json(silent=True) or {}
     username    = data.get("username", "").strip()
     password    = data.get("password", "")
     mac_address = data.get("mac_address", "").strip().upper()
@@ -83,30 +48,20 @@ def login():
     if not username or not password:
         return jsonify({"success": False, "message": "아이디와 비밀번호를 입력하세요"}), 400
 
-    conn = get_db()
-    user = conn.execute(
-        "SELECT * FROM users WHERE username = ?", (username,)
-    ).fetchone()
-
-    # 계정 존재 여부
-    if not user:
-        conn.close()
+    res = db.table("users").select("*").eq("username", username).execute()
+    if not res.data:
         return jsonify({"success": False, "message": "아이디 또는 비밀번호가 틀렸습니다"}), 401
 
-    # 비밀번호 확인
+    user = res.data[0]
+
     if user["password_hash"] != hash_password(password):
-        conn.close()
         return jsonify({"success": False, "message": "아이디 또는 비밀번호가 틀렸습니다"}), 401
 
-    # 계정 활성화 여부
     if not user["is_active"]:
-        conn.close()
         return jsonify({"success": False, "message": "비활성화된 계정입니다. 관리자에게 문의하세요"}), 401
 
-    # 사용기간 만료 여부
     today = datetime.date.today().isoformat()
     if user["expiry_date"] < today:
-        conn.close()
         return jsonify({
             "success": False,
             "message": f"사용기간이 만료되었습니다\n만료일: {user['expiry_date']}\n관리자에게 문의하세요"
@@ -114,15 +69,11 @@ def login():
 
     # MAC 주소 체크
     if mac_address:
-        existing = conn.execute(
-            "SELECT mac_address FROM user_macs WHERE user_id = ?", (user["id"],)
-        ).fetchall()
-        mac_list = [row["mac_address"] for row in existing]
+        mac_res  = db.table("user_macs").select("mac_address").eq("user_id", user["id"]).execute()
+        mac_list = [m["mac_address"] for m in mac_res.data]
 
         if mac_address not in mac_list:
-            # 새 PC - 허용 대수 초과 확인
             if len(mac_list) >= user["mac_limit"]:
-                conn.close()
                 return jsonify({
                     "success": False,
                     "message": (
@@ -131,34 +82,23 @@ def login():
                         f"관리자에게 PC 허용 대수 증가를 요청하세요"
                     )
                 }), 401
-            # 새 MAC 등록
-            conn.execute(
-                "INSERT INTO user_macs (user_id, mac_address) VALUES (?, ?)",
-                (user["id"], mac_address)
-            )
+            db.table("user_macs").insert({"user_id": user["id"], "mac_address": mac_address}).execute()
         else:
-            # 기존 PC - last_seen 갱신
-            conn.execute(
-                "UPDATE user_macs SET last_seen = datetime('now', 'localtime') WHERE user_id = ? AND mac_address = ?",
-                (user["id"], mac_address)
-            )
-        conn.commit()
+            now = datetime.datetime.utcnow().isoformat() + "Z"
+            db.table("user_macs").update({"last_seen": now}).eq("user_id", user["id"]).eq("mac_address", mac_address).execute()
 
-    conn.close()
-
-    # 만료까지 남은 일수
-    expiry = datetime.date.fromisoformat(user["expiry_date"])
+    expiry    = datetime.date.fromisoformat(user["expiry_date"])
     days_left = (expiry - datetime.date.today()).days
 
     return jsonify({
         "success": True,
         "message": "로그인 성공",
         "user": {
-            "username": user["username"],
-            "name": user["name"],
+            "username":    user["username"],
+            "name":        user["name"],
             "expiry_date": user["expiry_date"],
-            "days_left": days_left,
-            "mac_limit": user["mac_limit"]
+            "days_left":   days_left,
+            "mac_limit":   user["mac_limit"]
         }
     })
 
@@ -167,49 +107,35 @@ def login():
 @app.route("/api/admin/users", methods=["GET"])
 @require_admin
 def get_users():
-    """전체 사용자 목록 조회"""
-    conn = get_db()
-    users = conn.execute(
-        "SELECT * FROM users ORDER BY created_at DESC"
-    ).fetchall()
-
-    result = []
+    res   = db.table("users").select("*").order("created_at", desc=True).execute()
     today = datetime.date.today().isoformat()
-    for u in users:
-        macs = conn.execute(
-            "SELECT mac_address, registered_at, last_seen FROM user_macs WHERE user_id = ?",
-            (u["id"],)
-        ).fetchall()
+    result = []
+    for u in res.data:
+        mac_res = db.table("user_macs").select("mac_address, registered_at, last_seen").eq("user_id", u["id"]).execute()
         result.append({
-            "id":           u["id"],
-            "username":     u["username"],
-            "name":         u["name"],
-            "expiry_date":  u["expiry_date"],
-            "is_expired":   u["expiry_date"] < today,
-            "days_left":    (datetime.date.fromisoformat(u["expiry_date"]) - datetime.date.today()).days,
-            "mac_limit":    u["mac_limit"],
-            "mac_count":    len(macs),
-            "is_active":    bool(u["is_active"]),
-            "memo":         u["memo"],
-            "created_at":   u["created_at"],
+            "id":          u["id"],
+            "username":    u["username"],
+            "name":        u["name"],
+            "expiry_date": u["expiry_date"],
+            "is_expired":  u["expiry_date"] < today,
+            "days_left":   (datetime.date.fromisoformat(u["expiry_date"]) - datetime.date.today()).days,
+            "mac_limit":   u["mac_limit"],
+            "mac_count":   len(mac_res.data),
+            "is_active":   bool(u["is_active"]),
+            "memo":        u["memo"],
+            "created_at":  u["created_at"],
             "macs": [
-                {
-                    "mac": m["mac_address"],
-                    "registered_at": m["registered_at"],
-                    "last_seen": m["last_seen"]
-                } for m in macs
+                {"mac": m["mac_address"], "registered_at": m["registered_at"], "last_seen": m["last_seen"]}
+                for m in mac_res.data
             ]
         })
-
-    conn.close()
     return jsonify({"success": True, "users": result})
 
 
 @app.route("/api/admin/users", methods=["POST"])
 @require_admin
 def create_user():
-    """새 사용자 생성"""
-    data = request.get_json(silent=True) or {}
+    data        = request.get_json(silent=True) or {}
     username    = data.get("username", "").strip()
     password    = data.get("password", "")
     name        = data.get("name", "").strip()
@@ -220,46 +146,40 @@ def create_user():
     if not username or not password or not expiry_date:
         return jsonify({"success": False, "message": "아이디, 비밀번호, 사용기간은 필수입니다"}), 400
 
-    # 날짜 형식 검증
     try:
         datetime.date.fromisoformat(expiry_date)
     except ValueError:
         return jsonify({"success": False, "message": "날짜 형식이 올바르지 않습니다 (YYYY-MM-DD)"}), 400
 
-    conn = get_db()
     try:
-        conn.execute(
-            "INSERT INTO users (username, password_hash, name, expiry_date, mac_limit, memo) VALUES (?, ?, ?, ?, ?, ?)",
-            (username, hash_password(password), name, expiry_date, mac_limit, memo)
-        )
-        conn.commit()
-        conn.close()
+        db.table("users").insert({
+            "username":      username,
+            "password_hash": hash_password(password),
+            "name":          name,
+            "expiry_date":   expiry_date,
+            "mac_limit":     mac_limit,
+            "memo":          memo
+        }).execute()
         return jsonify({"success": True, "message": f"사용자 '{username}' 생성 완료"})
-    except sqlite3.IntegrityError:
-        conn.close()
-        return jsonify({"success": False, "message": f"이미 존재하는 아이디입니다: {username}"}), 400
+    except Exception as e:
+        msg = str(e)
+        if "duplicate" in msg.lower() or "unique" in msg.lower():
+            return jsonify({"success": False, "message": f"이미 존재하는 아이디입니다: {username}"}), 400
+        return jsonify({"success": False, "message": f"생성 실패: {msg}"}), 500
 
 
 @app.route("/api/admin/users/<username>/expiry", methods=["PUT"])
 @require_admin
 def update_expiry(username):
-    """사용기간 연장"""
-    data = request.get_json(silent=True) or {}
+    data        = request.get_json(silent=True) or {}
     expiry_date = data.get("expiry_date", "")
-
     try:
         datetime.date.fromisoformat(expiry_date)
     except ValueError:
         return jsonify({"success": False, "message": "날짜 형식이 올바르지 않습니다 (YYYY-MM-DD)"}), 400
 
-    conn = get_db()
-    result = conn.execute(
-        "UPDATE users SET expiry_date = ? WHERE username = ?", (expiry_date, username)
-    )
-    conn.commit()
-    conn.close()
-
-    if result.rowcount == 0:
+    res = db.table("users").update({"expiry_date": expiry_date}).eq("username", username).execute()
+    if not res.data:
         return jsonify({"success": False, "message": "사용자를 찾을 수 없습니다"}), 404
     return jsonify({"success": True, "message": f"'{username}' 사용기간 → {expiry_date}"})
 
@@ -267,21 +187,13 @@ def update_expiry(username):
 @app.route("/api/admin/users/<username>/mac_limit", methods=["PUT"])
 @require_admin
 def update_mac_limit(username):
-    """허용 PC 대수 변경"""
-    data = request.get_json(silent=True) or {}
+    data      = request.get_json(silent=True) or {}
     mac_limit = int(data.get("mac_limit", 1))
-
     if mac_limit < 1:
         return jsonify({"success": False, "message": "최소 1대 이상이어야 합니다"}), 400
 
-    conn = get_db()
-    result = conn.execute(
-        "UPDATE users SET mac_limit = ? WHERE username = ?", (mac_limit, username)
-    )
-    conn.commit()
-    conn.close()
-
-    if result.rowcount == 0:
+    res = db.table("users").update({"mac_limit": mac_limit}).eq("username", username).execute()
+    if not res.data:
         return jsonify({"success": False, "message": "사용자를 찾을 수 없습니다"}), 404
     return jsonify({"success": True, "message": f"'{username}' 허용 PC → {mac_limit}대"})
 
@@ -289,22 +201,13 @@ def update_mac_limit(username):
 @app.route("/api/admin/users/<username>/password", methods=["PUT"])
 @require_admin
 def reset_password(username):
-    """비밀번호 초기화"""
-    data = request.get_json(silent=True) or {}
+    data         = request.get_json(silent=True) or {}
     new_password = data.get("password", "")
-
     if not new_password:
         return jsonify({"success": False, "message": "새 비밀번호를 입력하세요"}), 400
 
-    conn = get_db()
-    result = conn.execute(
-        "UPDATE users SET password_hash = ? WHERE username = ?",
-        (hash_password(new_password), username)
-    )
-    conn.commit()
-    conn.close()
-
-    if result.rowcount == 0:
+    res = db.table("users").update({"password_hash": hash_password(new_password)}).eq("username", username).execute()
+    if not res.data:
         return jsonify({"success": False, "message": "사용자를 찾을 수 없습니다"}), 404
     return jsonify({"success": True, "message": f"'{username}' 비밀번호 변경 완료"})
 
@@ -312,18 +215,11 @@ def reset_password(username):
 @app.route("/api/admin/users/<username>/active", methods=["PUT"])
 @require_admin
 def update_active(username):
-    """계정 활성화/비활성화"""
-    data = request.get_json(silent=True) or {}
-    is_active = int(bool(data.get("is_active", True)))
+    data      = request.get_json(silent=True) or {}
+    is_active = bool(data.get("is_active", True))
 
-    conn = get_db()
-    result = conn.execute(
-        "UPDATE users SET is_active = ? WHERE username = ?", (is_active, username)
-    )
-    conn.commit()
-    conn.close()
-
-    if result.rowcount == 0:
+    res = db.table("users").update({"is_active": is_active}).eq("username", username).execute()
+    if not res.data:
         return jsonify({"success": False, "message": "사용자를 찾을 수 없습니다"}), 404
     status = "활성화" if is_active else "비활성화"
     return jsonify({"success": True, "message": f"'{username}' 계정 {status}"})
@@ -332,76 +228,43 @@ def update_active(username):
 @app.route("/api/admin/users/<username>/memo", methods=["PUT"])
 @require_admin
 def update_memo(username):
-    """메모 수정"""
     data = request.get_json(silent=True) or {}
     memo = data.get("memo", "")
-
-    conn = get_db()
-    conn.execute("UPDATE users SET memo = ? WHERE username = ?", (memo, username))
-    conn.commit()
-    conn.close()
+    db.table("users").update({"memo": memo}).eq("username", username).execute()
     return jsonify({"success": True, "message": "메모 저장 완료"})
 
 
 @app.route("/api/admin/users/<username>/macs/<path:mac_address>", methods=["DELETE"])
 @require_admin
 def delete_mac(username, mac_address):
-    """특정 MAC 주소 삭제 (PC 교체 등)"""
     mac_address = mac_address.upper()
-    conn = get_db()
-    user = conn.execute(
-        "SELECT id FROM users WHERE username = ?", (username,)
-    ).fetchone()
-
-    if not user:
-        conn.close()
+    user_res = db.table("users").select("id").eq("username", username).execute()
+    if not user_res.data:
         return jsonify({"success": False, "message": "사용자를 찾을 수 없습니다"}), 404
 
-    conn.execute(
-        "DELETE FROM user_macs WHERE user_id = ? AND mac_address = ?",
-        (user["id"], mac_address)
-    )
-    conn.commit()
-    conn.close()
+    user_id = user_res.data[0]["id"]
+    db.table("user_macs").delete().eq("user_id", user_id).eq("mac_address", mac_address).execute()
     return jsonify({"success": True, "message": f"MAC 주소 삭제 완료: {mac_address}"})
 
 
 @app.route("/api/admin/users/<username>/macs", methods=["DELETE"])
 @require_admin
 def delete_all_macs(username):
-    """모든 MAC 주소 초기화"""
-    conn = get_db()
-    user = conn.execute(
-        "SELECT id FROM users WHERE username = ?", (username,)
-    ).fetchone()
-
-    if not user:
-        conn.close()
+    user_res = db.table("users").select("id").eq("username", username).execute()
+    if not user_res.data:
         return jsonify({"success": False, "message": "사용자를 찾을 수 없습니다"}), 404
 
-    conn.execute("DELETE FROM user_macs WHERE user_id = ?", (user["id"],))
-    conn.commit()
-    conn.close()
+    user_id = user_res.data[0]["id"]
+    db.table("user_macs").delete().eq("user_id", user_id).execute()
     return jsonify({"success": True, "message": f"'{username}' MAC 주소 전체 초기화 완료"})
 
 
 @app.route("/api/admin/users/<username>", methods=["DELETE"])
 @require_admin
 def delete_user(username):
-    """사용자 삭제"""
-    conn = get_db()
-    user = conn.execute(
-        "SELECT id FROM users WHERE username = ?", (username,)
-    ).fetchone()
-
-    if not user:
-        conn.close()
+    res = db.table("users").delete().eq("username", username).execute()
+    if not res.data:
         return jsonify({"success": False, "message": "사용자를 찾을 수 없습니다"}), 404
-
-    conn.execute("DELETE FROM user_macs WHERE user_id = ?", (user["id"],))
-    conn.execute("DELETE FROM users WHERE username = ?", (username,))
-    conn.commit()
-    conn.close()
     return jsonify({"success": True, "message": f"'{username}' 삭제 완료"})
 
 
@@ -412,6 +275,5 @@ def health():
 
 # ===================== 실행 =====================
 if __name__ == "__main__":
-    init_db()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
