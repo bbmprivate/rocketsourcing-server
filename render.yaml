@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: rocketsourcing-auth
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: ADMIN_KEY
+        generateValue: false   # 직접 입력 (Render 대시보드에서 설정)
+      - key: DB_PATH
+        value: /data/users.db
+    disk:
+      name: db
+      mountPath: /data
+      sizeGB: 1
